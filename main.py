@@ -174,7 +174,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--infonce-temp", type=float, default=0.07)
     parser.add_argument("--lambda-attn", type=float, default=1.0)
-    parser.add_argument("--lambda-mono", type=float, default=0.1)
     parser.add_argument("--lambda-cov", type=float, default=0.0)
     parser.add_argument("--lambda-triplet", type=float, default=1.0)
     parser.add_argument(

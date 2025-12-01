@@ -137,23 +137,30 @@ class SceneDecoderLayer(nn.Module):
         tgt_key_padding_mask: Optional[torch.Tensor],
         memory_key_padding_mask: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        norm_tgt = self.norm1(tgt)
         attn_output, _ = self.self_attn(
-            tgt, tgt, tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask
+            norm_tgt,
+            norm_tgt,
+            norm_tgt,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
         )
-        tgt = self.norm1(tgt + self.dropout(attn_output))
+        tgt = tgt + self.dropout(attn_output)
 
+        norm_cross = self.norm2(tgt)
         cross_output, attn_weights = self.cross_attn(
-            tgt,
+            norm_cross,
             memory,
             memory,
             key_padding_mask=memory_key_padding_mask,
             need_weights=True,
             average_attn_weights=False,
         )
-        tgt = self.norm2(tgt + self.dropout(cross_output))
+        tgt = tgt + self.dropout(cross_output)
 
-        ff = self.linear2(F.gelu(self.linear1(tgt)))
-        tgt = self.norm3(tgt + self.dropout(ff))
+        norm_ff = self.norm3(tgt)
+        ff = self.linear2(F.gelu(self.linear1(norm_ff)))
+        tgt = tgt + self.dropout(ff)
         return tgt, attn_weights
 
 

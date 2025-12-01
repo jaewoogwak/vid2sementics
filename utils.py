@@ -327,6 +327,66 @@ def save_loss_plot(
     return output_path
 
 
+def save_loss_term_plots(
+    train_histories: Dict[str, Sequence[Tuple[int, float]]],
+    val_histories: Dict[str, Sequence[Tuple[int, float]]],
+    output_path: Optional[Path],
+) -> Optional[Path]:
+    if output_path is None:
+        return None
+    terms = sorted(
+        {
+            term
+            for term, history in train_histories.items()
+            if history
+        }.union(
+            {
+                term
+                for term, history in val_histories.items()
+                if history
+            }
+        )
+    )
+    if not terms:
+        return None
+    output_path = Path(output_path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cols = min(2, max(1, int(math.ceil(math.sqrt(len(terms))))))
+    rows = int(math.ceil(len(terms) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 3.5 * rows), squeeze=False)
+    for idx, term in enumerate(terms):
+        r = idx // cols
+        c = idx % cols
+        ax = axes[r][c]
+        train_history = train_histories.get(term, [])
+        val_history = val_histories.get(term, [])
+        if train_history:
+            steps = [step for step, _ in train_history]
+            values = [value for _, value in train_history]
+            ax.plot(steps, values, label="Train", color="#1f77b4")
+        if val_history:
+            steps = [step for step, _ in val_history]
+            values = [value for _, value in val_history]
+            ax.plot(steps, values, label="Validation", color="#d62728", linestyle="--", marker="o")
+        ax.set_title(f"{term.capitalize()} loss")
+        ax.set_xlabel("Global step")
+        ax.set_ylabel("Loss")
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+        if train_history or val_history:
+            ax.legend()
+    # Hide unused subplots
+    total_axes = rows * cols
+    for idx in range(len(terms), total_axes):
+        r = idx // cols
+        c = idx % cols
+        fig.delaxes(axes[r][c])
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    logging.info("Saved loss term plots -> %s", output_path)
+    return output_path
+
+
 def trim_eos_scene_predictions(
     scene_latents: torch.Tensor,
     attention_weights: Optional[torch.Tensor],

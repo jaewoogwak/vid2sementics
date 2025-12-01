@@ -27,7 +27,6 @@ from datasets import (
 )
 from losses import (
     attention_supervision_loss,
-    monotonicity_loss,
     representation_alignment_loss,
 )
 from models import (
@@ -51,6 +50,7 @@ from utils import (
     log_text_similarity_matrix,
     retrieve_clip_preview_frames,
     save_loss_plot,
+    save_loss_term_plots,
     save_similarity_heatmap,
     save_text_similarity_heatmap,
     set_seed,
@@ -87,7 +87,7 @@ def run_validation(
 
     was_training = scene_model.training
     scene_model.eval()
-    metrics = {"loss": 0.0, "repr": 0.0, "attn": 0.0, "mono": 0.0, "cov": 0.0, "stop": 0.0}
+    metrics = {"loss": 0.0, "repr": 0.0, "attn": 0.0, "cov": 0.0, "stop": 0.0}
     batches = 0
 
     schema_logged = not log_schema
@@ -142,7 +142,6 @@ def run_validation(
                 batch["scene_windows"],
                 batch["scene_lengths"],
             )
-            mono_loss = monotonicity_loss(attn, batch["clip_padding_mask"], batch["scene_lengths"])
             cov_loss = preds.new_tensor(0.0)
             stop_targets = torch.zeros_like(stop_logits)
             for idx_b, length in enumerate(batch["scene_lengths"]):
@@ -154,13 +153,11 @@ def run_validation(
             stop_loss = (bce_raw * valid_mask.float()).sum() / denom
             total_loss = rep_loss
             total_loss = total_loss + args.lambda_attn * attn_loss
-            total_loss = total_loss + args.lambda_mono * mono_loss
             total_loss = total_loss + args.lambda_stop * stop_loss
 
             metrics["loss"] += float(total_loss.item())
             metrics["repr"] += float(rep_loss.item())
             metrics["attn"] += float(attn_loss.item())
-            metrics["mono"] += float(mono_loss.item())
             metrics["cov"] += float(cov_loss.item())
             metrics["stop"] += float(stop_loss.item())
             batches += 1
@@ -822,11 +819,16 @@ def train(args: argparse.Namespace) -> None:
     steps_per_epoch = len(data_loader)
     validation_enabled = validation_loader is not None and steps_per_epoch > 0
 
+    def _record_loss(history: Dict[str, List[Tuple[int, float]]], name: str, step: int, value: float) -> None:
+        history.setdefault(name, []).append((step, value))
+
     global_step = 0
     logged_train_batch_schema = False
     logged_val_batch_schema = False
     train_history: List[Tuple[int, float]] = []
     val_history: List[Tuple[int, float]] = []
+    train_loss_terms: Dict[str, List[Tuple[int, float]]] = {}
+    val_loss_terms: Dict[str, List[Tuple[int, float]]] = {}
     best_val_loss: Optional[float] = None
     best_epoch: Optional[int] = None
     for epoch in range(1, args.epochs + 1):
@@ -873,7 +875,6 @@ def train(args: argparse.Namespace) -> None:
                 batch["scene_windows"],
                 batch["scene_lengths"],
             )
-            mono_loss = monotonicity_loss(attn, batch["clip_padding_mask"], batch["scene_lengths"])
             cov_loss = rep_loss.new_tensor(0.0)
             stop_targets = torch.zeros_like(stop_logits)
             for idx_b, length in enumerate(batch["scene_lengths"]):
@@ -885,7 +886,6 @@ def train(args: argparse.Namespace) -> None:
             stop_loss = (bce_raw * valid_mask.float()).sum() / denom
             total_loss = rep_loss
             total_loss = total_loss + args.lambda_attn * attn_loss
-            total_loss = total_loss + args.lambda_mono * mono_loss
             total_loss = total_loss + args.lambda_stop * stop_loss
 
             optimizer.zero_grad()
@@ -896,17 +896,20 @@ def train(args: argparse.Namespace) -> None:
             global_step += 1
             steps_in_epoch += 1
             train_history.append((global_step, float(total_loss.item())))
+            _record_loss(train_loss_terms, "total", global_step, float(total_loss.item()))
+            _record_loss(train_loss_terms, "repr", global_step, float(rep_loss.item()))
+            _record_loss(train_loss_terms, "attn", global_step, float(attn_loss.item()))
+            _record_loss(train_loss_terms, "stop", global_step, float(stop_loss.item()))
 
             stop_loss_scalar = float(stop_loss.item())
             if global_step % args.log_interval == 0:
                 logging.info(
-                    "Epoch %d step %d | loss=%.4f repr=%.4f attn=%.4f mono=%.4f cov=%.4f stop=%.4f",
+                    "Epoch %d step %d | loss=%.4f repr=%.4f attn=%.4f cov=%.4f stop=%.4f",
                     epoch,
                     global_step,
                     total_loss.item(),
                     rep_loss.item(),
                     attn_loss.item(),
-                    mono_loss.item(),
                     cov_loss.item(),
                     stop_loss_scalar,
                 )
@@ -953,16 +956,19 @@ def train(args: argparse.Namespace) -> None:
                 if not logged_val_batch_schema:
                     logged_val_batch_schema = True
                 logging.info(
-                    "Validation epoch %d | loss=%.4f repr=%.4f attn=%.4f mono=%.4f cov=%.4f stop=%.4f",
+                    "Validation epoch %d | loss=%.4f repr=%.4f attn=%.4f cov=%.4f stop=%.4f",
                     epoch,
                     metrics["loss"],
                     metrics["repr"],
                     metrics["attn"],
-                    metrics["mono"],
                     metrics["cov"],
                     metrics["stop"],
                 )
                 val_history.append((global_step, float(metrics["loss"])))
+                _record_loss(val_loss_terms, "total", global_step, float(metrics["loss"]))
+                _record_loss(val_loss_terms, "repr", global_step, float(metrics["repr"]))
+                _record_loss(val_loss_terms, "attn", global_step, float(metrics["attn"]))
+                _record_loss(val_loss_terms, "stop", global_step, float(metrics["stop"]))
                 if best_val_loss is None or metrics["loss"] < best_val_loss:
                     best_val_loss = float(metrics["loss"])
                     best_epoch = epoch
@@ -985,6 +991,11 @@ def train(args: argparse.Namespace) -> None:
             args.checkpoint_path,
         )
     save_loss_plot(train_history, val_history, args.loss_plot_path)
+    loss_terms_plot_path = None
+    if args.loss_plot_path is not None:
+        base_path = Path(args.loss_plot_path)
+        loss_terms_plot_path = base_path.with_name(f"{base_path.stem}_terms{base_path.suffix}")
+    save_loss_term_plots(train_loss_terms, val_loss_terms, loss_terms_plot_path)
 
     if args.run_inference_after_train:
         inference_dataset = ensure_inference_dataset()
