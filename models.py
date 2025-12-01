@@ -183,6 +183,12 @@ class SceneTransformer(nn.Module):
         )
         self.start_token = nn.Parameter(torch.randn(embed_dim))
         self.eos_token = nn.Parameter(torch.randn(embed_dim))
+        hidden_dim = max(64, embed_dim // 4)
+        self.stop_head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
 
     def project_text_embeddings(self, text_embeddings: torch.Tensor) -> torch.Tensor:
         return self.text_proj(text_embeddings)
@@ -266,7 +272,7 @@ class SceneTransformer(nn.Module):
         decoder_padding_mask: torch.Tensor,
         text_embeddings: Optional[torch.Tensor] = None,
         text_padding_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         del text_embeddings, text_padding_mask
         memory = self._prepare_memory(clip_embeddings, clip_times, clip_padding_mask)
         tgt, tgt_mask = self._prepare_targets(decoder_inputs, decoder_padding_mask)
@@ -282,9 +288,10 @@ class SceneTransformer(nn.Module):
             )
             attn_weights = attn
         outputs = self.output_proj(self.output_norm(x))
+        stop_logits = self.stop_head(outputs).squeeze(-1)
         if attn_weights is not None:
             attn_weights = attn_weights.mean(dim=1)
-        return outputs, attn_weights
+        return outputs, attn_weights, stop_logits
 
     @torch.no_grad()
     def generate(
@@ -333,9 +340,13 @@ class SceneTransformer(nn.Module):
                         device=device,
                     )
                 )
+            stop_logits = self.stop_head(pred_latent).squeeze(-1)
+            stop_prob = torch.sigmoid(stop_logits)
             inputs = torch.cat([inputs, feedback_token], dim=1)
             pad_row = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
             padding_mask = torch.cat([padding_mask, pad_row], dim=1)
+            if bool((stop_prob > 0.5).all()):
+                break
             eos_similarity = F.cosine_similarity(
                 pred_latent, self.eos_token.view(1, -1).to(device), dim=-1
             )

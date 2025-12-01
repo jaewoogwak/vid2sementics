@@ -87,7 +87,7 @@ def run_validation(
 
     was_training = scene_model.training
     scene_model.eval()
-    metrics = {"loss": 0.0, "repr": 0.0, "attn": 0.0, "mono": 0.0, "cov": 0.0}
+    metrics = {"loss": 0.0, "repr": 0.0, "attn": 0.0, "mono": 0.0, "cov": 0.0, "stop": 0.0}
     batches = 0
 
     schema_logged = not log_schema
@@ -111,7 +111,7 @@ def run_validation(
                 log_batch_schema(schema_label, batch)
                 schema_logged = True
 
-            preds, attn = scene_model(
+            preds, attn, stop_logits = scene_model(
                 batch["clip_embeddings"],
                 batch["clip_times"],
                 batch["clip_padding_mask"],
@@ -144,15 +144,25 @@ def run_validation(
             )
             mono_loss = monotonicity_loss(attn, batch["clip_padding_mask"], batch["scene_lengths"])
             cov_loss = preds.new_tensor(0.0)
+            stop_targets = torch.zeros_like(stop_logits)
+            for idx_b, length in enumerate(batch["scene_lengths"]):
+                last_idx = min(length, stop_targets.shape[1] - 1)
+                stop_targets[idx_b, last_idx] = 1.0
+            valid_mask = ~batch["decoder_padding_mask"]
+            bce_raw = F.binary_cross_entropy_with_logits(stop_logits, stop_targets, reduction="none")
+            denom = valid_mask.float().sum().clamp_min(1.0)
+            stop_loss = (bce_raw * valid_mask.float()).sum() / denom
             total_loss = rep_loss
             total_loss = total_loss + args.lambda_attn * attn_loss
             total_loss = total_loss + args.lambda_mono * mono_loss
+            total_loss = total_loss + args.lambda_stop * stop_loss
 
             metrics["loss"] += float(total_loss.item())
             metrics["repr"] += float(rep_loss.item())
             metrics["attn"] += float(attn_loss.item())
             metrics["mono"] += float(mono_loss.item())
             metrics["cov"] += float(cov_loss.item())
+            metrics["stop"] += float(stop_loss.item())
             batches += 1
 
     if was_training:
@@ -839,7 +849,7 @@ def train(args: argparse.Namespace) -> None:
                 log_batch_schema("Train", batch)
                 logged_train_batch_schema = True
 
-            preds, attn = scene_model(
+            preds, attn, stop_logits = scene_model(
                 batch["clip_embeddings"],
                 batch["clip_times"],
                 batch["clip_padding_mask"],
@@ -865,9 +875,18 @@ def train(args: argparse.Namespace) -> None:
             )
             mono_loss = monotonicity_loss(attn, batch["clip_padding_mask"], batch["scene_lengths"])
             cov_loss = rep_loss.new_tensor(0.0)
+            stop_targets = torch.zeros_like(stop_logits)
+            for idx_b, length in enumerate(batch["scene_lengths"]):
+                last_idx = min(length, stop_targets.shape[1] - 1)
+                stop_targets[idx_b, last_idx] = 1.0
+            valid_mask = ~batch["decoder_padding_mask"]
+            bce_raw = F.binary_cross_entropy_with_logits(stop_logits, stop_targets, reduction="none")
+            denom = valid_mask.float().sum().clamp_min(1.0)
+            stop_loss = (bce_raw * valid_mask.float()).sum() / denom
             total_loss = rep_loss
             total_loss = total_loss + args.lambda_attn * attn_loss
             total_loss = total_loss + args.lambda_mono * mono_loss
+            total_loss = total_loss + args.lambda_stop * stop_loss
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -878,9 +897,10 @@ def train(args: argparse.Namespace) -> None:
             steps_in_epoch += 1
             train_history.append((global_step, float(total_loss.item())))
 
+            stop_loss_scalar = float(stop_loss.item())
             if global_step % args.log_interval == 0:
                 logging.info(
-                    "Epoch %d step %d | loss=%.4f repr=%.4f attn=%.4f mono=%.4f cov=%.4f",
+                    "Epoch %d step %d | loss=%.4f repr=%.4f attn=%.4f mono=%.4f cov=%.4f stop=%.4f",
                     epoch,
                     global_step,
                     total_loss.item(),
@@ -888,6 +908,7 @@ def train(args: argparse.Namespace) -> None:
                     attn_loss.item(),
                     mono_loss.item(),
                     cov_loss.item(),
+                    stop_loss_scalar,
                 )
 
             if args.inference_interval > 0 and global_step % args.inference_interval == 0:
@@ -932,13 +953,14 @@ def train(args: argparse.Namespace) -> None:
                 if not logged_val_batch_schema:
                     logged_val_batch_schema = True
                 logging.info(
-                    "Validation epoch %d | loss=%.4f repr=%.4f attn=%.4f mono=%.4f cov=%.4f",
+                    "Validation epoch %d | loss=%.4f repr=%.4f attn=%.4f mono=%.4f cov=%.4f stop=%.4f",
                     epoch,
                     metrics["loss"],
                     metrics["repr"],
                     metrics["attn"],
                     metrics["mono"],
                     metrics["cov"],
+                    metrics["stop"],
                 )
                 val_history.append((global_step, float(metrics["loss"])))
                 if best_val_loss is None or metrics["loss"] < best_val_loss:

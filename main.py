@@ -177,6 +177,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-mono", type=float, default=0.1)
     parser.add_argument("--lambda-cov", type=float, default=0.0)
     parser.add_argument("--lambda-triplet", type=float, default=1.0)
+    parser.add_argument(
+        "--lambda-stop",
+        type=float,
+        default=1.0,
+        help="Weight applied to the stop-head BCE loss.",
+    )
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-generation-steps", type=int, default=12)
