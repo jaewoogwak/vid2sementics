@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -77,6 +78,28 @@ class ActivityNetSceneItem:
     timestamps: List[Tuple[float, float]]
     duration: float
     fps: float
+
+
+@dataclass
+class TVRFeatureMeta:
+    video_id: str
+    duration: float
+    scene_texts: List[str]
+    timestamps: List[Tuple[float, float]]
+    text_keys: List[str]
+    num_clips: int
+
+
+@dataclass
+class TVRSceneItem:
+    video_id: str
+    clip_embeddings: torch.Tensor
+    clip_times: torch.Tensor
+    scene_texts: List[str]
+    scene_windows: List[Tuple[float, float]]
+    text_embeddings: torch.Tensor
+    timestamps: List[Tuple[float, float]]
+    duration: float
 
 
 def parse_vid_identifier(vid: str) -> Tuple[str, float, float]:
@@ -316,15 +339,26 @@ class MSRVTTUntrimmedDataset(Dataset):
             )
         clip_embeddings = clip_embeddings.float()
 
+        clip_count = clip_embeddings.shape[0] if clip_embeddings.ndim >= 1 else clip_embeddings.numel()
         raw_clip_times = None
         if isinstance(vision, dict):
             for key in ("clip_times", "times", "timestamps"):
                 if key in vision:
                     raw_clip_times = vision[key]
                     break
-        clip_count = clip_embeddings.shape[0] if clip_embeddings.ndim >= 1 else clip_embeddings.numel()
         if raw_clip_times is None:
-            clip_times = torch.arange(clip_count, dtype=torch.float32)
+            if len(meta.scene_windows) == clip_count:
+                centers = [0.5 * (float(s) + float(e)) for (s, e) in meta.scene_windows]
+                clip_times = torch.tensor(centers, dtype=torch.float32)
+            else:
+                logging.warning(
+                    "Video %s: missing clip_times and scene_windows len (%d) != clip_count (%d); "
+                    "falling back to index-based times.",
+                    meta.video_id,
+                    len(meta.scene_windows),
+                    clip_count,
+                )
+                clip_times = torch.arange(clip_count, dtype=torch.float32)
         else:
             clip_times = (
                 raw_clip_times.float()
@@ -619,6 +653,234 @@ class ActivityNetSceneDataset(Dataset):
         return sample
 
 
+class TVRSceneDataset(Dataset):
+    def __init__(
+        self,
+        annotation_path: Path,
+        video_feat_path: Path,
+        text_feat_path: Path,
+        *,
+        split_name: str = "train",
+        cache_features: bool = True,
+        sanity_samples: int = 5,
+    ) -> None:
+        if h5py is None:
+            raise ImportError("h5py is required to read TVR HDF5 features. Please install h5py first.")
+        self.annotation_path = annotation_path.expanduser()
+        self.video_feat_path = video_feat_path.expanduser()
+        self.text_feat_path = text_feat_path.expanduser()
+        self.split_name = split_name
+        self.cache_features = cache_features
+        self.items: List[TVRFeatureMeta] = self._load_metadata()
+        if not self.items:
+            raise RuntimeError(
+                f"TVR split '{self.split_name}' has no valid videos (annotation={self.annotation_path})"
+            )
+        self.total_queries = sum(len(meta.scene_texts) for meta in self.items)
+        self._feature_cache: Dict[str, TVRSceneItem] = {}
+        self.feature_dim = self._infer_feature_dim()
+        self._run_sanity_checks(samples=sanity_samples)
+        logging.info(
+            "TVR dataset loaded: split=%s videos=%d queries=%d feature_dim=%d",
+            self.split_name,
+            len(self.items),
+            self.total_queries,
+            self.feature_dim,
+        )
+
+    def _load_metadata(self) -> List[TVRFeatureMeta]:
+        with open(self.annotation_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"TVR annotation {self.annotation_path} must be a JSON object mapping video ids."
+            )
+        items: List[TVRFeatureMeta] = []
+        assert h5py is not None
+        with h5py.File(self.video_feat_path, "r") as video_file, h5py.File(
+            self.text_feat_path, "r"
+        ) as text_file:
+            available_videos = set(video_file.keys())
+            for video_id, entry in data.items():
+                if not isinstance(entry, dict):
+                    continue
+                duration = float(entry.get("duration") or 0.0)
+                if duration <= 0:
+                    logging.warning(
+                        "Skipping %s: invalid duration %.3f (split=%s)",
+                        video_id,
+                        duration,
+                        self.split_name,
+                    )
+                    continue
+                sentences = entry.get("sentences") or []
+                timestamps = entry.get("timestamps") or []
+                if not sentences or not timestamps:
+                    logging.warning("Skipping %s: empty sentences/timestamps", video_id)
+                    continue
+                if len(sentences) != len(timestamps):
+                    limit = min(len(sentences), len(timestamps))
+                    logging.warning(
+                        "Video %s: mismatch between sentences (%d) and timestamps (%d); truncating to %d",
+                        video_id,
+                        len(sentences),
+                        len(timestamps),
+                        limit,
+                    )
+                    sentences = sentences[:limit]
+                    timestamps = timestamps[:limit]
+                if video_id not in available_videos:
+                    logging.warning(
+                        "Skipping %s: missing video features in %s",
+                        video_id,
+                        self.video_feat_path,
+                    )
+                    continue
+                video_dataset = video_file[video_id]
+                if video_dataset.ndim != 2:
+                    logging.warning(
+                        "Skipping %s: expected 2D video embeddings, got shape=%s",
+                        video_id,
+                        video_dataset.shape,
+                    )
+                    continue
+                num_clips = int(video_dataset.shape[0])
+                if num_clips <= 0:
+                    logging.warning("Skipping %s: no video clips stored", video_id)
+                    continue
+                resolved_timestamps: List[Tuple[float, float]] = []
+                resolved_texts: List[str] = []
+                for sent, window in zip(sentences, timestamps):
+                    if not isinstance(window, (list, tuple)) or len(window) != 2:
+                        continue
+                    start = float(window[0])
+                    end = float(window[1])
+                    if math.isnan(start) or math.isnan(end) or end <= start:
+                        continue
+                    resolved_timestamps.append((start, end))
+                    resolved_texts.append(str(sent))
+                if not resolved_texts:
+                    logging.warning("Skipping %s: no valid timestamp/text pairs", video_id)
+                    continue
+                text_keys: List[str] = []
+                missing_text = False
+                missing_key: Optional[str] = None
+                for idx in range(len(resolved_texts)):
+                    key = f"{video_id}#enc#{idx}"
+                    if key not in text_file:
+                        missing_text = True
+                        missing_key = key
+                        break
+                    text_keys.append(key)
+                if missing_text:
+                    logging.warning(
+                        "Skipping %s: missing text features for key %s in %s",
+                        video_id,
+                        missing_key,
+                        self.text_feat_path,
+                    )
+                    continue
+                items.append(
+                    TVRFeatureMeta(
+                        video_id=video_id,
+                        duration=duration,
+                        scene_texts=resolved_texts,
+                        timestamps=resolved_timestamps,
+                        text_keys=text_keys,
+                        num_clips=num_clips,
+                    )
+                )
+        return items
+
+    def _load_sample(self, meta: TVRFeatureMeta) -> TVRSceneItem:
+        assert h5py is not None
+        with h5py.File(self.video_feat_path, "r") as video_file:
+            video_array = np.array(video_file[meta.video_id], dtype=np.float32)
+        clip_embeddings = torch.from_numpy(video_array)
+        clip_times = self._build_clip_times(meta.duration, meta.num_clips)
+        text_features: List[np.ndarray] = []
+        with h5py.File(self.text_feat_path, "r") as text_file:
+            for key in meta.text_keys:
+                text_features.append(np.array(text_file[key], dtype=np.float32))
+        text_embeddings = torch.from_numpy(np.stack(text_features, axis=0))
+        return TVRSceneItem(
+            video_id=meta.video_id,
+            clip_embeddings=clip_embeddings,
+            clip_times=clip_times,
+            scene_texts=meta.scene_texts,
+            scene_windows=meta.timestamps,
+            text_embeddings=text_embeddings,
+            timestamps=meta.timestamps,
+            duration=meta.duration,
+        )
+
+    @staticmethod
+    def _build_clip_times(duration: float, num_clips: int) -> torch.Tensor:
+        if num_clips <= 0:
+            return torch.empty(0)
+        duration = max(duration, 1e-3)
+        edges = torch.linspace(0.0, duration, steps=num_clips + 1, dtype=torch.float32)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        return centers
+
+    def _infer_feature_dim(self) -> int:
+        if not self.items:
+            return 0
+        first = self.items[0]
+        sample = self._load_sample(first)
+        self._feature_cache[first.video_id] = sample
+        if sample.clip_embeddings.ndim != 2:
+            raise RuntimeError(f"TVR vision feats for {first.video_id} missing clip dimension.")
+        return int(sample.clip_embeddings.shape[1])
+
+    def _run_sanity_checks(self, *, samples: int) -> None:
+        if not self.items or samples <= 0:
+            return
+        rng = random.Random(0)
+        sample_count = min(samples, len(self.items))
+        indices = rng.sample(range(len(self.items)), sample_count)
+        for idx in indices:
+            meta = self.items[idx]
+            sentences = meta.scene_texts
+            timestamps = meta.timestamps
+            assert len(sentences) == len(timestamps), (
+                f"TVR sanity check failed for {meta.video_id}: sentences/timestamps mismatch"
+            )
+            if not timestamps:
+                continue
+            expected = meta.duration / max(1, len(timestamps))
+            prev_end = 0.0
+            for seg_idx, (start, end) in enumerate(timestamps):
+                if start < prev_end - 1e-3:
+                    raise AssertionError(
+                        f"TVR sanity check failed for {meta.video_id}: segment {seg_idx} overlaps"
+                    )
+                prev_end = end
+                seg_len = end - start
+                tolerance = max(1.0, 0.35 * expected)
+                if abs(seg_len - expected) > tolerance:
+                    raise AssertionError(
+                        f"TVR sanity check failed for {meta.video_id}: segment length {seg_len:.3f} differs from expected {expected:.3f}"
+                    )
+            last_end = timestamps[-1][1]
+            if abs(last_end - meta.duration) > max(1.0, 0.05 * meta.duration):
+                raise AssertionError(
+                    f"TVR sanity check failed for {meta.video_id}: last timestamp {last_end:.3f} != duration {meta.duration:.3f}"
+                )
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> TVRSceneItem:
+        meta = self.items[idx]
+        if self.cache_features and meta.video_id in self._feature_cache:
+            return self._feature_cache[meta.video_id]
+        sample = self._load_sample(meta)
+        if self.cache_features:
+            self._feature_cache[meta.video_id] = sample
+        return sample
+
+
 def get_video_cache_path(video_cache_root: Path, video_id: str) -> Path:
     return video_cache_root / f"{video_id}.pt"
 
@@ -773,9 +1035,13 @@ def collate_scene_batch(
             clip_feats_cpu = sample.clip_embeddings
             clip_times_tensor = sample.clip_times
             text_embeddings = sample.text_embeddings
-        elif dataset_type == "activitynet":
-            if not isinstance(sample, ActivityNetSceneItem):
-                raise TypeError("ActivityNet dataset expected ActivityNetSceneItem samples.")
+        elif dataset_type in {"activitynet", "tvr"}:
+            if dataset_type == "activitynet":
+                expected = ActivityNetSceneItem
+            else:
+                expected = TVRSceneItem
+            if not isinstance(sample, expected):
+                raise TypeError(f"{dataset_type} dataset expected {expected.__name__} samples.")
             clip_feats_cpu = sample.clip_embeddings
             clip_times_tensor = sample.clip_times
             text_embeddings = sample.text_embeddings

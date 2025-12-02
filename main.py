@@ -17,7 +17,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="qvhighlights",
-        choices=("qvhighlights", "msrvtt_untrimmed", "activitynet"),
+        choices=("qvhighlights", "msrvtt_untrimmed", "activitynet", "tvr"),
         help="Dataset to use for training/inference.",
     )
     parser.add_argument(
@@ -125,6 +125,43 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Annotation JSON used for ActivityNet inference (default: val JSON).",
     )
+    default_tvr_root = repo_root / "dataset" / "tvr"
+    parser.add_argument(
+        "--tvr-root",
+        type=Path,
+        default=default_tvr_root,
+        help="Root directory containing TVR features and annotations.",
+    )
+    parser.add_argument(
+        "--tvr-video-features",
+        type=Path,
+        default=None,
+        help="HDF5 file storing CLIP vision features for TVR videos.",
+    )
+    parser.add_argument(
+        "--tvr-text-features",
+        type=Path,
+        default=None,
+        help="HDF5 file storing CLIP text features for TVR sentences.",
+    )
+    parser.add_argument(
+        "--tvr-train-json",
+        type=Path,
+        default=None,
+        help="TVR training annotation JSON.",
+    )
+    parser.add_argument(
+        "--tvr-val-json",
+        type=Path,
+        default=None,
+        help="TVR validation annotation JSON.",
+    )
+    parser.add_argument(
+        "--tvr-inference-json",
+        type=Path,
+        default=None,
+        help="TVR annotation JSON used for inference (default: val JSON).",
+    )
     parser.add_argument(
         "--raw-root",
         type=Path,
@@ -167,6 +204,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-ff-dim", type=int, default=2048)
     parser.add_argument("--decoder-dropout", type=float, default=0.1)
     parser.add_argument(
+        "--disable-text-projection",
+        action="store_true",
+        help="Skip the learnable text projection layer and use raw text embeddings.",
+    )
+    parser.add_argument(
         "--alignment-loss",
         type=str,
         choices=("mse", "infonce"),
@@ -177,6 +219,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-cov", type=float, default=0.0)
     parser.add_argument("--lambda-triplet", type=float, default=1.0)
     parser.add_argument(
+        "--lambda-scene-query",
+        type=float,
+        default=0.0,
+        help="Weight for the per-video scene/query matrix loss.",
+    )
+    parser.add_argument(
         "--lambda-stop",
         type=float,
         default=1.0,
@@ -186,6 +234,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-generation-steps", type=int, default=12)
     parser.add_argument("--eos-threshold", type=float, default=0.8)
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help="Number of consecutive validation epochs without improvement before stopping (0 disables).",
+    )
+    parser.add_argument(
+        "--use-exhaustive-clip-bank",
+        action="store_true",
+        help="Enable exhaustive sliding-window clip bank encoding before the transformer encoder.",
+    )
     parser.add_argument(
         "--checkpoint-path",
         type=Path,
@@ -220,6 +279,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Directory used to store inference visualizations (default: alongside the JSONL output).",
+    )
+    parser.add_argument(
+        "--validation-visualization-dir",
+        type=Path,
+        default=None,
+        help="Directory used for saving per-epoch validation similarity heatmaps (default: alongside inference output).",
+    )
+    parser.add_argument(
+        "--validation-visualization-video-id",
+        type=str,
+        default=None,
+        help="Validation video_id used when logging similarity matrices (default: disable logging).",
     )
     parser.add_argument(
         "--inference-visualization-max-scenes",

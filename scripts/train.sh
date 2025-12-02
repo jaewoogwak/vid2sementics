@@ -38,13 +38,20 @@ ACTIVITYNET_TRAIN_JSON="${ACTIVITYNET_TRAIN_JSON:-${ACTIVITYNET_ROOT}/TextData/t
 ACTIVITYNET_VAL_JSON="${ACTIVITYNET_VAL_JSON:-${ACTIVITYNET_ROOT}/TextData/val_1.json}"
 ACTIVITYNET_INFER_JSON="${ACTIVITYNET_INFER_JSON:-${ACTIVITYNET_VAL_JSON}}"
 
+TVR_ROOT="${TVR_ROOT:-${ROOT}/dataset/tvr}"
+TVR_VIDEO_FEATURES="${TVR_VIDEO_FEATURES:-${TVR_ROOT}/FeatureData/new_clip_vit_32_tvr_vid_features.hdf5}"
+TVR_TEXT_FEATURES="${TVR_TEXT_FEATURES:-${TVR_ROOT}/TextData/clip_ViT_B_32_tvr_query_feat.hdf5}"
+TVR_TRAIN_JSON="${TVR_TRAIN_JSON:-${TVR_ROOT}/TextData/train.json}"
+TVR_VAL_JSON="${TVR_VAL_JSON:-${TVR_ROOT}/TextData/val.json}"
+TVR_INFER_JSON="${TVR_INFER_JSON:-${TVR_VAL_JSON}}"
+
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-}" 
 INFERENCE_OUTPUT="${INFERENCE_OUTPUT:-}" 
 RUN_INFERENCE="${RUN_INFERENCE:-true}"
 
 DEVICE="${DEVICE:-cuda}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
-EPOCHS="${EPOCHS:-100}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
+EPOCHS="${EPOCHS:-50}"
 LR="${LR:-1e-4}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 
@@ -54,16 +61,22 @@ CLIP_STRIDE="${CLIP_STRIDE:-4}"
 FRAME_SIZE="${FRAME_SIZE:-224}"
 CLIP_BATCH_SIZE="${CLIP_BATCH_SIZE:-16}"
 
-DECODER_LAYERS="${DECODER_LAYERS:-12}"
+DECODER_LAYERS="${DECODER_LAYERS:-4}"
 DECODER_HEADS="${DECODER_HEADS:-8}"
 DECODER_FF_DIM="${DECODER_FF_DIM:-2048}"
 DECODER_DROPOUT="${DECODER_DROPOUT:-0.1}"
+EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-5}"
+USE_EXHAUSTIVE_CLIP_BANK="${USE_EXHAUSTIVE_CLIP_BANK:-false}"
+DISABLE_TEXT_PROJECTION="${DISABLE_TEXT_PROJECTION:-false}"
+VAL_VIS_DIR="${VAL_VIS_DIR:-video0_video1_video2}"
+VAL_VIS_VIDEO_ID="${VAL_VIS_VIDEO_ID:-video0_video1_video2}"
 
 ALIGNMENT_LOSS="${ALIGNMENT_LOSS:-infonce}"
 INFO_NCE_TEMP="${INFO_NCE_TEMP:-0.07}"
-LAMBDA_ATTN="${LAMBDA_ATTN:-20}"
+LAMBDA_ATTN="${LAMBDA_ATTN:-0.5}"
 LAMBDA_COV="${LAMBDA_COV:-0.0}"
 LAMBDA_STOP="${LAMBDA_STOP:-0.3}"
+LAMBDA_SCENE_QUERY="${LAMBDA_SCENE_QUERY:-1.0}"
 # LAMBDA_TRIPLET="${LAMBDA_TRIPLET:-0.5}"
 
 MAX_GENERATION_STEPS="${MAX_GENERATION_STEPS:-12}"
@@ -115,11 +128,13 @@ COMMON_ARGS=(
   --decoder-heads "${DECODER_HEADS}"
   --decoder-ff-dim "${DECODER_FF_DIM}"
   --decoder-dropout "${DECODER_DROPOUT}"
+  --early-stopping-patience "${EARLY_STOPPING_PATIENCE}"
   --alignment-loss "${ALIGNMENT_LOSS}"
   --infonce-temp "${INFO_NCE_TEMP}"
   --lambda-attn "${LAMBDA_ATTN}"
   --lambda-cov "${LAMBDA_COV}"
   --lambda-stop "${LAMBDA_STOP}"
+  --lambda-scene-query "${LAMBDA_SCENE_QUERY}"
   # --lambda-triplet "${LAMBDA_TRIPLET}"
   --max-generation-steps "${MAX_GENERATION_STEPS}"
   --eos-threshold "${EOS_THRESHOLD}"
@@ -135,8 +150,21 @@ if [[ "${RUN_INFERENCE,,}" == "true" ]]; then
   COMMON_ARGS+=(--run-inference-after-train)
 fi
 
+if [[ "${USE_EXHAUSTIVE_CLIP_BANK,,}" == "true" ]]; then
+  COMMON_ARGS+=(--use-exhaustive-clip-bank)
+fi
+if [[ "${DISABLE_TEXT_PROJECTION,,}" == "true" ]]; then
+  COMMON_ARGS+=(--disable-text-projection)
+fi
+
 if [[ -n "${INFERENCE_LIMIT}" ]]; then
   COMMON_ARGS+=(--inference-limit "${INFERENCE_LIMIT}")
+fi
+if [[ -n "${VAL_VIS_DIR}" ]]; then
+  COMMON_ARGS+=(--validation-visualization-dir "${VAL_VIS_DIR}")
+fi
+if [[ -n "${VAL_VIS_VIDEO_ID}" ]]; then
+  COMMON_ARGS+=(--validation-visualization-video-id "${VAL_VIS_VIDEO_ID}")
 fi
 
 case "${DATASET}" in
@@ -167,6 +195,16 @@ case "${DATASET}" in
       --activitynet-train-json "${ACTIVITYNET_TRAIN_JSON}"
       --activitynet-val-json "${ACTIVITYNET_VAL_JSON}"
       --activitynet-inference-json "${ACTIVITYNET_INFER_JSON}"
+    )
+    ;;
+  tvr)
+    COMMON_ARGS+=(
+      --tvr-root "${TVR_ROOT}"
+      --tvr-video-features "${TVR_VIDEO_FEATURES}"
+      --tvr-text-features "${TVR_TEXT_FEATURES}"
+      --tvr-train-json "${TVR_TRAIN_JSON}"
+      --tvr-val-json "${TVR_VAL_JSON}"
+      --tvr-inference-json "${TVR_INFER_JSON}"
     )
     ;;
 esac

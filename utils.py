@@ -82,6 +82,24 @@ def log_activitynet_dataset_samples(name: str, dataset, limit: int = 3) -> None:
         )
 
 
+def log_tvr_dataset_samples(name: str, dataset, limit: int = 3) -> None:
+    if len(dataset) == 0:
+        logging.info("%s dataset empty; no samples to display.", name)
+        return
+    limit = min(limit, len(dataset.items))
+    for idx in range(limit):
+        item = dataset.items[idx]
+        logging.info(
+            "%s sample %d | video_id=%s | scenes=%d | duration=%.2f | timestamps=%s",
+            name,
+            idx,
+            item.video_id,
+            len(item.scene_texts),
+            item.duration,
+            item.timestamps,
+        )
+
+
 def log_batch_schema(name: str, batch: Dict[str, torch.Tensor]) -> None:
     entries: List[str] = []
     for key, value in batch.items():

@@ -13,16 +13,15 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 from torch.nn import functional as F
 
-from train_scene_autoregressive_qvh import (
-    ActivityNetSceneDataset,
+from datasets import ActivityNetSceneDataset, MSRVTTUntrimmedDataset, TVRSceneDataset
+from models import (
     InternVideo2TextBackbone,
-    MSRVTTUntrimmedDataset,
     SceneTransformer,
-    load_checkpoint,
     load_internvideo2_config,
     setup_internvideo2_model,
-    trim_eos_scene_predictions,
 )
+from trainer import load_checkpoint
+from utils import trim_eos_scene_predictions
 
 try:
     import h5py  # type: ignore
@@ -164,6 +163,70 @@ class MSRVTTUntrimmedRetrievalDataset:
     def load_video_sample(self, video_id: str):
         dataset, idx = self.lookup[video_id]
         return dataset[idx]
+
+
+class TVRRetrievalDataset:
+    def __init__(
+        self,
+        annotation_path: Path,
+        video_feat_path: Path,
+        text_feat_path: Path,
+    ) -> None:
+        self.annotation_path = annotation_path.expanduser()
+        self.video_feat_path = video_feat_path.expanduser()
+        self.text_feat_path = text_feat_path.expanduser()
+        self.dataset = TVRSceneDataset(
+            annotation_path=self.annotation_path,
+            video_feat_path=self.video_feat_path,
+            text_feat_path=self.text_feat_path,
+            split_name="val",
+        )
+        self.feature_dim = self.dataset.feature_dim
+        self.items = self.dataset.items
+        self.video_ids = [meta.video_id for meta in self.items]
+        self._index = {meta.video_id: idx for idx, meta in enumerate(self.items)}
+        queries: List[RetrievalQuery] = []
+        if h5py is None:
+            raise ImportError("h5py is required to load TVR text embeddings.")
+        with h5py.File(self.text_feat_path, "r") as text_file:
+            for meta in self.items:
+                for idx, sentence in enumerate(meta.scene_texts):
+                    text = sentence.strip()
+                    if not text:
+                        continue
+                    key = meta.text_keys[idx]
+                    arr = np.array(text_file[key], dtype=np.float32)
+                    tensor = torch.from_numpy(arr)
+                    queries.append(
+                        RetrievalQuery(
+                            video_id=meta.video_id,
+                            text=text,
+                            precomputed_embedding=tensor,
+                        )
+                    )
+        self.queries = queries
+
+    def get_queries(
+        self,
+        limit: Optional[int] = None,
+        allowed_videos: Optional[Sequence[str]] = None,
+    ) -> List[RetrievalQuery]:
+        pool = self.queries
+        if allowed_videos is not None:
+            allowed = set(allowed_videos)
+            pool = [query for query in pool if query.video_id in allowed]
+        if limit is not None:
+            return pool[:limit]
+        return pool
+
+    def get_video_ids(self, limit: Optional[int] = None) -> List[str]:
+        if limit is None:
+            return list(self.video_ids)
+        return self.video_ids[:limit]
+
+    def load_video_sample(self, video_id: str):
+        idx = self._index[video_id]
+        return self.dataset[idx]
 
 
 @dataclass
@@ -429,6 +492,7 @@ def build_scene_model(args, embed_dim: int, device: torch.device) -> SceneTransf
         num_heads=args.decoder_heads,
         ff_dim=args.decoder_ff_dim,
         dropout=args.decoder_dropout,
+        use_text_projection=not args.disable_text_projection,
     ).to(device)
     load_checkpoint(model, args.checkpoint, device)
     model.eval()
@@ -441,7 +505,7 @@ def parse_args() -> argparse.Namespace:
     default_msrvtt_root = repo_root / "dataset" / "data" / "MSRVTT"
     default_activitynet_root = repo_root / "dataset" / "activitynet"
     parser = argparse.ArgumentParser(description="Evaluate text-to-video retrieval using SceneTransformer.")
-    parser.add_argument("--dataset", choices=("msrvtt_untrimmed", "activitynet"), required=True)
+    parser.add_argument("--dataset", choices=("msrvtt_untrimmed", "activitynet", "tvr"), required=True)
     parser.add_argument("--mode", default="retrieval")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to SceneTransformer checkpoint.")
     parser.add_argument("--device", type=str, default="cuda")
@@ -451,6 +515,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-heads", type=int, default=8)
     parser.add_argument("--decoder-ff-dim", type=int, default=2048)
     parser.add_argument("--decoder-dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--disable-text-projection",
+        action="store_true",
+        help="Skip SceneTransformer text projection (use raw text embeddings).",
+    )
     parser.add_argument("--max-generation-steps", type=int, default=12)
     parser.add_argument("--eos-threshold", type=float, default=0.8)
     parser.add_argument("--max-scene-candidates", type=int, default=2048, help="Scene candidates inspected per query before falling back to full sort.")
@@ -508,6 +577,23 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=default_activitynet_root / "TextData" / "val_1.json",
     )
+    default_tvr_root = repo_root / "dataset" / "tvr"
+    parser.add_argument("--tvr-root", type=Path, default=default_tvr_root)
+    parser.add_argument(
+        "--tvr-video-features",
+        type=Path,
+        default=default_tvr_root / "FeatureData" / "new_clip_vit_32_tvr_vid_features.hdf5",
+    )
+    parser.add_argument(
+        "--tvr-text-features",
+        type=Path,
+        default=default_tvr_root / "TextData" / "clip_ViT_B_32_tvr_query_feat.hdf5",
+    )
+    parser.add_argument(
+        "--tvr-val-json",
+        type=Path,
+        default=default_tvr_root / "TextData" / "val.json",
+    )
     return parser.parse_args()
 
 
@@ -543,11 +629,17 @@ def main() -> None:
             train_split=args.msrvtt_train_split,
             val_split=args.msrvtt_val_split,
         )
-    else:
+    elif dataset_name == "activitynet":
         dataset = ActivityNetRetrievalDataset(
             annotation_path=args.activitynet_val_json.expanduser(),
             video_feat_path=args.activitynet_video_features.expanduser(),
             text_feat_path=args.activitynet_text_features.expanduser(),
+        )
+    else:
+        dataset = TVRRetrievalDataset(
+            annotation_path=args.tvr_val_json.expanduser(),
+            video_feat_path=args.tvr_video_features.expanduser(),
+            text_feat_path=args.tvr_text_features.expanduser(),
         )
     video_ids = dataset.get_video_ids(limit=args.max_videos)
     queries = dataset.get_queries(limit=args.max_queries, allowed_videos=video_ids)

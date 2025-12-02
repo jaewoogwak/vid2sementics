@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import List, Tuple
 
 import numpy as np
@@ -99,6 +100,57 @@ def compute_hard_triplet_loss(
     return criterion(anchor, positive, negatives)
 
 
+def scene_query_matrix_loss(
+    scene_preds: List[torch.Tensor],
+    text_targets: List[torch.Tensor],
+    temperature: float = 0.07,
+    text_sim_threshold: float = 0.85,
+) -> torch.Tensor:
+    if not scene_preds or not text_targets:
+        return torch.tensor(0.0)
+
+    device = scene_preds[0].device
+    total = scene_preds[0].new_tensor(0.0)
+    count = 0
+
+    for sp, tt in zip(scene_preds, text_targets):
+        if sp.numel() == 0 or tt.numel() == 0:
+            continue
+
+        S = F.normalize(sp, dim=-1)
+        T = F.normalize(tt, dim=-1)
+        n = min(S.size(0), T.size(0))
+        if n < 2:
+            continue
+
+        S = S[:n]
+        T = T[:n]
+
+        sim = S @ T.T / temperature
+
+        with torch.no_grad():
+            text_sim = T @ T.T
+            eye = torch.eye(n, device=device, dtype=torch.bool)
+            invalid_neg = (text_sim > text_sim_threshold) & (~eye)
+
+        row_logits = sim.clone()
+        row_logits.masked_fill_(invalid_neg, -1e9)
+        row_labels = torch.arange(n, device=device)
+        loss_row = F.cross_entropy(row_logits, row_labels)
+
+        col_logits = sim.T.clone()
+        col_logits.masked_fill_(invalid_neg.T, -1e9)
+        col_labels = torch.arange(n, device=device)
+        loss_col = F.cross_entropy(col_logits, col_labels)
+
+        total = total + 0.5 * (loss_row + loss_col)
+        count += 1
+
+    if count == 0:
+        return total
+    return total / count
+
+
 def kl_divergence(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     p = p.clamp_min(1e-6)
     q = q.clamp_min(1e-6)
@@ -129,11 +181,10 @@ def attention_supervision_loss(
             gt_mask = (times >= start) & (times <= end)
             if not gt_mask.any():
                 continue
-            gt = gt_mask.float()
-            gt /= gt.sum()
             pred = attn_weights[b, j, clip_mask]
-            pred /= pred.sum()
-            total = total + kl_divergence(gt, pred)
+            pred = pred / pred.sum().clamp_min(1e-6)
+            mass = pred[gt_mask].sum()
+            total = total - torch.log(mass + 1e-6)
             count += 1
     if count == 0:
         return total

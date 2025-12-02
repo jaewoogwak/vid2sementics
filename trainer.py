@@ -17,6 +17,8 @@ from datasets import (
     MSRVTTSceneItem,
     MSRVTTUntrimmedDataset,
     QVHighlightsDataset,
+    TVRSceneDataset,
+    TVRSceneItem,
     build_video_clips,
     collate_scene_batch,
     load_text_cache,
@@ -28,6 +30,7 @@ from datasets import (
 from losses import (
     attention_supervision_loss,
     representation_alignment_loss,
+    scene_query_matrix_loss,
 )
 from models import (
     InternVideo2TextBackbone,
@@ -45,6 +48,7 @@ from utils import (
     log_batch_schema,
     log_dataset_samples,
     log_msrvtt_dataset_samples,
+    log_tvr_dataset_samples,
     log_scene_text_similarity_matrix,
     log_teacher_forcing_cosines,
     log_text_similarity_matrix,
@@ -81,16 +85,24 @@ def run_validation(
     dataset_type: str,
     schema_label: str = "Validation",
     log_schema: bool = False,
+    viz_video_id: Optional[str] = None,
+    viz_dir: Optional[Path] = None,
+    epoch: Optional[int] = None,
 ) -> Optional[Dict[str, float]]:
     if data_loader is None:
         return None
 
     was_training = scene_model.training
     scene_model.eval()
-    metrics = {"loss": 0.0, "repr": 0.0, "attn": 0.0, "cov": 0.0, "stop": 0.0}
+    metrics = {"loss": 0.0, "repr": 0.0, "attn": 0.0, "cov": 0.0, "stop": 0.0, "sceneq": 0.0}
     batches = 0
 
     schema_logged = not log_schema
+    viz_logged = False
+    viz_epoch_dir: Optional[Path] = None
+    if viz_dir is not None and epoch is not None:
+        viz_epoch_dir = viz_dir / f"epoch_{epoch:03d}"
+        viz_epoch_dir.mkdir(parents=True, exist_ok=True)
     cosine_values: List[np.ndarray] = []
 
     with torch.no_grad():
@@ -118,6 +130,121 @@ def run_validation(
                 batch["decoder_inputs"],
                 batch["decoder_padding_mask"],
             )
+            if (
+                not viz_logged
+                and viz_epoch_dir is not None
+                and viz_video_id is not None
+                and batch_samples
+                and batch["scene_lengths"]
+            ):
+                sample_idx = None
+                raw_text_embed = None
+                for idx_s, sample in enumerate(batch_samples):
+                    if getattr(sample, "video_id", None) == viz_video_id:
+                        sample_idx = idx_s
+                        if hasattr(sample, "text_embeddings") and sample.text_embeddings is not None:
+                            raw_text_embed = sample.text_embeddings
+                        break
+                if sample_idx is not None and sample_idx < len(batch_samples):
+                    sample_length = batch["scene_lengths"][sample_idx]
+                    sample_texts = getattr(batch_samples[sample_idx], "scene_texts", None)
+                    if raw_text_embed is None and sample_texts and text_backbone is not None:
+                        raw_text_embed = text_backbone.encode(sample_texts)
+                    if raw_text_embed is None:
+                        raw_text_embed = batch["decoder_targets"][sample_idx, :sample_length, :].detach()
+                    if sample_texts and sample_length > 0:
+                        pred_sample = preds[sample_idx, :sample_length, :].detach().cpu()
+                        raw_tensor = raw_text_embed[:sample_length].detach().cpu()
+                        text_proj = scene_model.project_text_embeddings(raw_text_embed.to(device))
+                        target_sample = text_proj[:sample_length].detach().cpu()
+                        if pred_sample.numel() > 0 and target_sample.numel() > 0:
+                            scene_norm = F.normalize(pred_sample, dim=-1)
+                            text_norm = F.normalize(target_sample, dim=-1)
+                            scene_text_sim = (scene_norm @ text_norm.T).numpy()
+                            text_text_sim = (text_norm @ text_norm.T).numpy()
+                            raw_text_norm = F.normalize(raw_tensor, dim=-1)
+                            raw_text_sim = (raw_text_norm @ raw_text_norm.T).numpy()
+                            log_scene_text_similarity_matrix(
+                                viz_video_id,
+                                scene_text_sim,
+                                sample_texts,
+                            )
+                            log_text_similarity_matrix(
+                                f"{viz_video_id} (raw)",
+                                raw_text_sim,
+                                sample_texts,
+                            )
+                            log_text_similarity_matrix(
+                                viz_video_id,
+                                text_text_sim,
+                                sample_texts,
+                            )
+                            heatmap_scene = save_similarity_heatmap(
+                                viz_video_id,
+                                scene_text_sim,
+                                sample_texts,
+                                viz_epoch_dir,
+                            )
+                            heatmap_text = save_text_similarity_heatmap(
+                                viz_video_id,
+                                text_text_sim,
+                                sample_texts,
+                                viz_epoch_dir,
+                            )
+                            raw_heatmap = save_text_similarity_heatmap(
+                                f"raw_{viz_video_id}",
+                                raw_text_sim,
+                                sample_texts,
+                                viz_epoch_dir,
+                            )
+                            log_path = viz_epoch_dir / f"{viz_video_id.replace('/', '_')}_similarity.txt"
+                            with open(log_path, "w", encoding="utf-8") as fh:
+                                fh.write(
+                                    f"Epoch {epoch} validation video {viz_video_id}\n"
+                                    f"Text queries (n={len(sample_texts)}):\n"
+                                )
+                                for idx_q, text in enumerate(sample_texts):
+                                    fh.write(f"  Query {idx_q}: {text}\n")
+                                fh.write("Raw text-text cosine similarities:\n")
+                                fh.write(
+                                    np.array2string(
+                                        raw_text_sim,
+                                        precision=3,
+                                        suppress_small=True,
+                                    )
+                                    + "\n"
+                                )
+                                fh.write("Projected text-text cosine similarities:\n")
+                                fh.write(
+                                    np.array2string(
+                                        text_text_sim,
+                                        precision=3,
+                                        suppress_small=True,
+                                    )
+                                    + "\n"
+                                )
+                                fh.write("Scene-text cosine similarities:\n")
+                                fh.write(
+                                    np.array2string(
+                                        scene_text_sim,
+                                        precision=3,
+                                        suppress_small=True,
+                                    )
+                                    + "\n"
+                                )
+                            logging.info(
+                                "Validation epoch %d sample %s | scene-text mean=%.4f | text-text mean=%.4f | raw_mean=%.4f | sim_heatmap=%s | text_heatmap=%s | raw_heatmap=%s | log=%s",
+                                epoch,
+                                viz_video_id,
+                                float(scene_text_sim.mean()),
+                                float(text_text_sim.mean()),
+                                float(raw_text_sim.mean()),
+                                heatmap_scene,
+                                heatmap_text,
+                                raw_heatmap,
+                                log_path,
+                            )
+                            viz_logged = True
             cosines = compute_teacher_forcing_cosines(
                 preds,
                 batch["decoder_targets"],
@@ -143,6 +270,17 @@ def run_validation(
                 batch["scene_lengths"],
             )
             cov_loss = preds.new_tensor(0.0)
+            scene_pred_list: List[torch.Tensor] = []
+            text_target_list: List[torch.Tensor] = []
+            for idx_b, length in enumerate(batch["scene_lengths"]):
+                if length <= 0:
+                    continue
+                scene_pred_list.append(preds[idx_b, :length, :])
+                text_target_list.append(batch["decoder_targets"][idx_b, :length, :])
+            if scene_pred_list:
+                sceneq_loss = scene_query_matrix_loss(scene_pred_list, text_target_list)
+            else:
+                sceneq_loss = preds.new_tensor(0.0)
             stop_targets = torch.zeros_like(stop_logits)
             for idx_b, length in enumerate(batch["scene_lengths"]):
                 last_idx = min(length, stop_targets.shape[1] - 1)
@@ -154,12 +292,14 @@ def run_validation(
             total_loss = rep_loss
             total_loss = total_loss + args.lambda_attn * attn_loss
             total_loss = total_loss + args.lambda_stop * stop_loss
+            total_loss = total_loss + args.lambda_scene_query * sceneq_loss
 
             metrics["loss"] += float(total_loss.item())
             metrics["repr"] += float(rep_loss.item())
             metrics["attn"] += float(attn_loss.item())
             metrics["cov"] += float(cov_loss.item())
             metrics["stop"] += float(stop_loss.item())
+            metrics["sceneq"] += float(sceneq_loss.item())
             batches += 1
 
     if was_training:
@@ -206,11 +346,13 @@ def run_inference(
         for idx, sample in enumerate(dataset, start=1):
             if max_videos is not None and processed >= max_videos:
                 break
-            if dataset_type in {"msrvtt_untrimmed", "activitynet"}:
+            if dataset_type in {"msrvtt_untrimmed", "activitynet", "tvr"}:
                 if dataset_type == "msrvtt_untrimmed":
                     expected = MSRVTTSceneItem
-                else:
+                elif dataset_type == "activitynet":
                     expected = ActivityNetSceneItem
+                else:
+                    expected = TVRSceneItem
                 if not isinstance(sample, expected):
                     raise TypeError(
                         f"{dataset_type} inference expects {expected.__name__} samples."
@@ -308,15 +450,16 @@ def run_inference(
             text_text_heatmap_path: Optional[Path] = None
             text_embeds: Optional[torch.Tensor] = None
             if scene_texts:
-                if dataset_type in {"msrvtt_untrimmed", "activitynet"}:
+                if dataset_type in {"msrvtt_untrimmed", "activitynet", "tvr"}:
                     text_embeds = text_embed_source.to(device)
                 else:
                     if text_backbone is None:
                         raise RuntimeError("Text backbone required for QVHighlights inference.")
-                    text_embeds = text_backbone.encode(scene_texts).to(device)
+                        text_embeds = text_backbone.encode(scene_texts).to(device)
             if text_embeds is not None and text_embeds.numel() > 0:
-                text_embeddings_export = text_embeds.detach().cpu().tolist()
-                text_norm = F.normalize(text_embeds, dim=-1)
+                projected_text = scene_model.project_text_embeddings(text_embeds)
+                text_embeddings_export = projected_text.detach().cpu().tolist()
+                text_norm = F.normalize(projected_text, dim=-1)
                 text_text_similarity_tensor = text_norm @ text_norm.T
                 text_text_similarity_np = text_text_similarity_tensor.detach().cpu().numpy()
                 text_text_similarities = text_text_similarity_tensor.detach().cpu().tolist()
@@ -329,9 +472,8 @@ def run_inference(
                 )
                 if text_text_heatmap_path is not None:
                     logging.info("Saved text similarity heatmap -> %s", text_text_heatmap_path)
-                text_proj = scene_model.project_text_embeddings(text_embeds)
-                if scene_latents_cpu.numel() > 0 and text_proj.numel() > 0:
-                    text_proj_cpu = text_proj.cpu()
+                if scene_latents_cpu.numel() > 0 and projected_text.numel() > 0:
+                    text_proj_cpu = projected_text.detach().cpu()
                     scene_norm = F.normalize(scene_latents_cpu, dim=-1)
                     text_norm = F.normalize(text_proj_cpu, dim=-1)
                     text_similarity_tensor = scene_norm @ text_norm.T
@@ -573,6 +715,27 @@ def train(args: argparse.Namespace) -> None:
         if args.activitynet_inference_json is None:
             args.activitynet_inference_json = args.activitynet_val_json
         args.activitynet_inference_json = args.activitynet_inference_json.expanduser()
+    elif args.dataset == "tvr":
+        args.tvr_root = args.tvr_root.expanduser()
+        if args.tvr_video_features is None:
+            args.tvr_video_features = (
+                args.tvr_root / "FeatureData" / "new_clip_vit_32_tvr_vid_features.hdf5"
+            )
+        if args.tvr_text_features is None:
+            args.tvr_text_features = (
+                args.tvr_root / "TextData" / "clip_ViT_B_32_tvr_query_feat.hdf5"
+            )
+        if args.tvr_train_json is None:
+            args.tvr_train_json = args.tvr_root / "TextData" / "train.json"
+        if args.tvr_val_json is None:
+            args.tvr_val_json = args.tvr_root / "TextData" / "val.json"
+        args.tvr_video_features = args.tvr_video_features.expanduser()
+        args.tvr_text_features = args.tvr_text_features.expanduser()
+        args.tvr_train_json = args.tvr_train_json.expanduser()
+        args.tvr_val_json = args.tvr_val_json.expanduser()
+        if args.tvr_inference_json is None:
+            args.tvr_inference_json = args.tvr_val_json
+        args.tvr_inference_json = args.tvr_inference_json.expanduser()
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
     if args.inference_output is None:
@@ -584,7 +747,16 @@ def train(args: argparse.Namespace) -> None:
         if args.inference_visualization_dir is None:
             args.inference_visualization_dir = args.inference_output.parent / "visualizations"
         args.inference_visualization_dir = args.inference_visualization_dir.expanduser()
+        args.inference_visualization_dir.mkdir(parents=True, exist_ok=True)
     args.inference_visualization_max_scenes = max(1, int(args.inference_visualization_max_scenes))
+    if args.mode == "train":
+        if args.validation_visualization_dir is None:
+            args.validation_visualization_dir = args.inference_output.parent / "val_similarity"
+        args.validation_visualization_dir = args.validation_visualization_dir.expanduser()
+        args.validation_visualization_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        args.validation_visualization_dir = None
+    val_target_viz_video = getattr(args, "validation_visualization_video_id", None)
     if args.checkpoint_path is None:
         args.checkpoint_path = Path("scene_transformer.pt")
     args.checkpoint_path = args.checkpoint_path.expanduser()
@@ -632,6 +804,19 @@ def train(args: argparse.Namespace) -> None:
             )
         return activitynet_dataset_cache[resolved]
 
+    tvr_dataset_cache: Dict[Path, TVRSceneDataset] = {}
+
+    def get_tvr_dataset(annotation_path: Path, split_name: str) -> TVRSceneDataset:
+        resolved = annotation_path.expanduser()
+        if resolved not in tvr_dataset_cache:
+            tvr_dataset_cache[resolved] = TVRSceneDataset(
+                resolved,
+                args.tvr_video_features,
+                args.tvr_text_features,
+                split_name=split_name,
+            )
+        return tvr_dataset_cache[resolved]
+
     video_backbone: Optional[InternVideo2VideoBackbone] = None
     text_backbone: Optional[InternVideo2TextBackbone] = None
     embed_dim: Optional[int] = None
@@ -655,10 +840,16 @@ def train(args: argparse.Namespace) -> None:
         split = args.msrvtt_train_split if args.mode != "inference" else args.msrvtt_inference_split
         primary_dataset = get_msrvtt_dataset(split)
         embed_dim = primary_dataset.feature_dim
-    else:
+    elif args.dataset == "activitynet":
         annotation = args.activitynet_train_json if args.mode != "inference" else args.activitynet_inference_json
         primary_dataset = get_activitynet_dataset(annotation, split_name=args.mode)
         embed_dim = primary_dataset.feature_dim
+    elif args.dataset == "tvr":
+        annotation = args.tvr_train_json if args.mode != "inference" else args.tvr_inference_json
+        primary_dataset = get_tvr_dataset(annotation, split_name=args.mode)
+        embed_dim = primary_dataset.feature_dim
+    else:
+        raise ValueError(f"Unsupported dataset for embed_dim inference: {args.dataset}")
 
     if embed_dim is None:
         raise RuntimeError("Failed to determine embedding dimension for the scene model.")
@@ -669,6 +860,8 @@ def train(args: argparse.Namespace) -> None:
         num_heads=args.decoder_heads,
         ff_dim=args.decoder_ff_dim,
         dropout=args.decoder_dropout,
+        use_exhaustive_clip_bank=getattr(args, "use_exhaustive_clip_bank", False),
+        use_text_projection=not getattr(args, "disable_text_projection", False),
     ).to(device)
 
     inference_dataset_cache: Optional[Dataset] = None
@@ -697,7 +890,7 @@ def train(args: argparse.Namespace) -> None:
                         inference_dataset_cache.total_queries,
                     )
                     log_msrvtt_dataset_samples("Inference", inference_dataset_cache)
-                else:
+                elif args.dataset == "activitynet":
                     inference_dataset_cache = get_activitynet_dataset(
                         args.activitynet_inference_json,
                         split_name="inference",
@@ -708,6 +901,17 @@ def train(args: argparse.Namespace) -> None:
                         inference_dataset_cache.total_queries,
                     )
                     log_activitynet_dataset_samples("Inference", inference_dataset_cache)
+                else:
+                    inference_dataset_cache = get_tvr_dataset(
+                        args.tvr_inference_json,
+                        split_name="inference",
+                    )
+                    logging.info(
+                        "Inference dataset stats: %d videos, %d queries",
+                        len(inference_dataset_cache),
+                        inference_dataset_cache.total_queries,
+                    )
+                    log_tvr_dataset_samples("Inference", inference_dataset_cache)
             except Exception as exc:
                 inference_dataset_error = exc
                 if args.mode == "inference":
@@ -758,7 +962,7 @@ def train(args: argparse.Namespace) -> None:
             dataset.total_queries,
         )
         log_msrvtt_dataset_samples("Train", dataset)
-    else:
+    elif args.dataset == "activitynet":
         dataset = get_activitynet_dataset(args.activitynet_train_json, split_name="train")
         logging.info(
             "Train dataset stats: %d videos, %d queries",
@@ -766,6 +970,14 @@ def train(args: argparse.Namespace) -> None:
             dataset.total_queries,
         )
         log_activitynet_dataset_samples("Train", dataset)
+    else:
+        dataset = get_tvr_dataset(args.tvr_train_json, split_name="train")
+        logging.info(
+            "Train dataset stats: %d videos, %d queries",
+            len(dataset),
+            dataset.total_queries,
+        )
+        log_tvr_dataset_samples("Train", dataset)
     data_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -794,7 +1006,7 @@ def train(args: argparse.Namespace) -> None:
                     validation_dataset.total_queries,
                 )
                 log_msrvtt_dataset_samples("Validation", validation_dataset)
-            else:
+            elif args.dataset == "activitynet":
                 validation_dataset = get_activitynet_dataset(
                     args.activitynet_val_json,
                     split_name="val",
@@ -805,6 +1017,17 @@ def train(args: argparse.Namespace) -> None:
                     validation_dataset.total_queries,
                 )
                 log_activitynet_dataset_samples("Validation", validation_dataset)
+            else:
+                validation_dataset = get_tvr_dataset(
+                    args.tvr_val_json,
+                    split_name="val",
+                )
+                logging.info(
+                    "Validation dataset stats: %d videos, %d queries",
+                    len(validation_dataset),
+                    validation_dataset.total_queries,
+                )
+                log_tvr_dataset_samples("Validation", validation_dataset)
         except RuntimeError as exc:
             logging.warning("Validation disabled: %s", exc)
         else:
@@ -831,6 +1054,9 @@ def train(args: argparse.Namespace) -> None:
     val_loss_terms: Dict[str, List[Tuple[int, float]]] = {}
     best_val_loss: Optional[float] = None
     best_epoch: Optional[int] = None
+    early_stopping_patience = max(0, int(getattr(args, "early_stopping_patience", 0) or 0))
+    epochs_without_improvement = 0
+    stop_training = False
     for epoch in range(1, args.epochs + 1):
         scene_model.train()
         steps_in_epoch = 0
@@ -876,6 +1102,17 @@ def train(args: argparse.Namespace) -> None:
                 batch["scene_lengths"],
             )
             cov_loss = rep_loss.new_tensor(0.0)
+            scene_pred_list = []
+            text_target_list = []
+            for idx_b, length in enumerate(batch["scene_lengths"]):
+                if length <= 0:
+                    continue
+                scene_pred_list.append(preds[idx_b, :length, :])
+                text_target_list.append(batch["decoder_targets"][idx_b, :length, :])
+            if scene_pred_list:
+                sceneq_loss = scene_query_matrix_loss(scene_pred_list, text_target_list)
+            else:
+                sceneq_loss = rep_loss.new_tensor(0.0)
             stop_targets = torch.zeros_like(stop_logits)
             for idx_b, length in enumerate(batch["scene_lengths"]):
                 last_idx = min(length, stop_targets.shape[1] - 1)
@@ -887,6 +1124,7 @@ def train(args: argparse.Namespace) -> None:
             total_loss = rep_loss
             total_loss = total_loss + args.lambda_attn * attn_loss
             total_loss = total_loss + args.lambda_stop * stop_loss
+            total_loss = total_loss + args.lambda_scene_query * sceneq_loss
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -900,11 +1138,13 @@ def train(args: argparse.Namespace) -> None:
             _record_loss(train_loss_terms, "repr", global_step, float(rep_loss.item()))
             _record_loss(train_loss_terms, "attn", global_step, float(attn_loss.item()))
             _record_loss(train_loss_terms, "stop", global_step, float(stop_loss.item()))
+            sceneq_loss_scalar = float(sceneq_loss.item())
+            _record_loss(train_loss_terms, "sceneq", global_step, sceneq_loss_scalar)
 
             stop_loss_scalar = float(stop_loss.item())
             if global_step % args.log_interval == 0:
                 logging.info(
-                    "Epoch %d step %d | loss=%.4f repr=%.4f attn=%.4f cov=%.4f stop=%.4f",
+                    "Epoch %d step %d | loss=%.4f repr=%.4f attn=%.4f cov=%.4f stop=%.4f sceneq=%.4f",
                     epoch,
                     global_step,
                     total_loss.item(),
@@ -912,6 +1152,7 @@ def train(args: argparse.Namespace) -> None:
                     attn_loss.item(),
                     cov_loss.item(),
                     stop_loss_scalar,
+                    sceneq_loss_scalar,
                 )
 
             if args.inference_interval > 0 and global_step % args.inference_interval == 0:
@@ -939,6 +1180,8 @@ def train(args: argparse.Namespace) -> None:
                         max_videos=args.inference_limit,
                         dataset_type=args.dataset,
                     )
+        if stop_training:
+            break
 
         if validation_enabled:
             metrics = run_validation(
@@ -951,25 +1194,31 @@ def train(args: argparse.Namespace) -> None:
                 dataset_type=args.dataset,
                 schema_label="Validation",
                 log_schema=not logged_val_batch_schema,
+                viz_video_id=val_target_viz_video,
+                viz_dir=args.validation_visualization_dir,
+                epoch=epoch,
             )
             if metrics is not None:
                 if not logged_val_batch_schema:
                     logged_val_batch_schema = True
                 logging.info(
-                    "Validation epoch %d | loss=%.4f repr=%.4f attn=%.4f cov=%.4f stop=%.4f",
+                    "Validation epoch %d | loss=%.4f repr=%.4f attn=%.4f cov=%.4f stop=%.4f sceneq=%.4f",
                     epoch,
                     metrics["loss"],
                     metrics["repr"],
                     metrics["attn"],
                     metrics["cov"],
                     metrics["stop"],
+                    metrics["sceneq"],
                 )
                 val_history.append((global_step, float(metrics["loss"])))
                 _record_loss(val_loss_terms, "total", global_step, float(metrics["loss"]))
                 _record_loss(val_loss_terms, "repr", global_step, float(metrics["repr"]))
                 _record_loss(val_loss_terms, "attn", global_step, float(metrics["attn"]))
                 _record_loss(val_loss_terms, "stop", global_step, float(metrics["stop"]))
-                if best_val_loss is None or metrics["loss"] < best_val_loss:
+                _record_loss(val_loss_terms, "sceneq", global_step, float(metrics["sceneq"]))
+                improved = best_val_loss is None or metrics["loss"] < best_val_loss
+                if improved:
                     best_val_loss = float(metrics["loss"])
                     best_epoch = epoch
                     save_checkpoint(scene_model, args.checkpoint_path)
@@ -979,6 +1228,23 @@ def train(args: argparse.Namespace) -> None:
                         best_val_loss,
                         args.checkpoint_path,
                     )
+                    epochs_without_improvement = 0
+                else:
+                    if early_stopping_patience > 0:
+                        epochs_without_improvement += 1
+                        logging.info(
+                            "Validation not improved for %d/%d epochs",
+                            epochs_without_improvement,
+                            early_stopping_patience,
+                        )
+                        if epochs_without_improvement >= early_stopping_patience:
+                            logging.info(
+                                "Early stopping triggered after %d epochs without improvement.",
+                                epochs_without_improvement,
+                            )
+                            stop_training = True
+            if stop_training:
+                break
 
     if best_epoch is None:
         save_checkpoint(scene_model, args.checkpoint_path)
