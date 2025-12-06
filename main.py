@@ -199,6 +199,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-stride", type=int, default=4)
     parser.add_argument("--frame-size", type=int, default=224)
     parser.add_argument("--clip-batch-size", type=int, default=16)
+    parser.add_argument(
+        "--ss-enable",
+        action="store_true",
+        help="Enable scheduled sampling for decoder inputs during training.",
+    )
+    parser.add_argument(
+        "--ss-p-max",
+        type=float,
+        default=0.3,
+        help="Maximum scheduled sampling probability.",
+    )
+    parser.add_argument(
+        "--ss-warmup-epochs",
+        type=int,
+        default=3,
+        help="Number of epochs to keep scheduled sampling disabled before ramping up.",
+    )
     parser.add_argument("--decoder-layers", type=int, default=4)
     parser.add_argument("--decoder-heads", type=int, default=8)
     parser.add_argument("--decoder-ff-dim", type=int, default=2048)
@@ -223,6 +240,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Weight for the per-video scene/query matrix loss.",
+    )
+    parser.add_argument(
+        "--lambda-scene-diversity",
+        type=float,
+        default=0.0,
+        help="Weight for the structured scene diversity loss.",
     )
     parser.add_argument(
         "--lambda-stop",
@@ -293,6 +316,23 @@ def parse_args() -> argparse.Namespace:
         help="Validation video_id used when logging similarity matrices (default: disable logging).",
     )
     parser.add_argument(
+        "--train-visualization-dir",
+        type=Path,
+        default=None,
+        help="Directory used for saving per-epoch train similarity heatmaps (default: alongside inference output).",
+    )
+    parser.add_argument(
+        "--train-visualization-video-id",
+        type=str,
+        default=None,
+        help="Train video_id used when logging similarity matrices each epoch (default: disable logging).",
+    )
+    parser.add_argument(
+        "--disable-validation-visualizations",
+        action="store_true",
+        help="Skip saving similarity heatmaps and logs during validation.",
+    )
+    parser.add_argument(
         "--inference-visualization-max-scenes",
         type=int,
         default=6,
@@ -338,6 +378,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="Fraction of an epoch after which to run validation (0 disables).",
+    )
+    parser.add_argument(
+        "--validation-final-epoch-only",
+        action="store_true",
+        help="Run validation only after the final training epoch.",
     )
     parser.add_argument(
         "--loss-plot-path",

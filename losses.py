@@ -151,6 +151,53 @@ def scene_query_matrix_loss(
     return total / count
 
 
+def scene_diversity_loss_structured(
+    scene_preds: List[torch.Tensor],
+    text_targets: List[torch.Tensor],
+    gamma: float = 1.0,
+) -> torch.Tensor:
+    total = None
+    fallback_device: Optional[torch.device] = None
+    count = 0
+    for scenes, texts in zip(scene_preds, text_targets):
+        if scenes is None or texts is None:
+            continue
+        if fallback_device is None and isinstance(scenes, torch.Tensor):
+            fallback_device = scenes.device
+        if scenes.numel() == 0 or texts.numel() == 0:
+            continue
+        n = min(scenes.shape[0], texts.shape[0])
+        if n <= 1:
+            continue
+        scenes_use = scenes[:n]
+        texts_use = texts[:n]
+        if total is None:
+            total = scenes_use.new_tensor(0.0)
+        scene_norm = F.normalize(scenes_use, dim=-1)
+        text_norm = F.normalize(texts_use, dim=-1)
+        scene_cos = scene_norm @ scene_norm.T
+        text_cos = text_norm @ text_norm.T
+        off_mask = ~torch.eye(n, dtype=torch.bool, device=scenes_use.device)
+        scene_off = scene_cos[off_mask]
+        text_off = text_cos[off_mask]
+        weights = (1.0 - text_off).clamp_min(0.0)
+        if gamma != 1.0:
+            weights = weights ** gamma
+        diff = (scene_off - text_off) ** 2
+        weighted = weights * diff
+        denom = weights.sum().clamp_min(1e-6)
+        total = total + weighted.sum() / denom
+        count += 1
+        if fallback_device is None:
+            fallback_device = scenes.device
+    if count == 0:
+        if total is None:
+            device = fallback_device or torch.device("cpu")
+            return torch.tensor(0.0, device=device)
+        return total
+    return total / count
+
+
 def kl_divergence(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     p = p.clamp_min(1e-6)
     q = q.clamp_min(1e-6)

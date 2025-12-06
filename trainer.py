@@ -30,6 +30,7 @@ from datasets import (
 from losses import (
     attention_supervision_loss,
     representation_alignment_loss,
+    scene_diversity_loss_structured,
     scene_query_matrix_loss,
 )
 from models import (
@@ -94,7 +95,15 @@ def run_validation(
 
     was_training = scene_model.training
     scene_model.eval()
-    metrics = {"loss": 0.0, "repr": 0.0, "attn": 0.0, "cov": 0.0, "stop": 0.0, "sceneq": 0.0}
+    metrics = {
+        "loss": 0.0,
+        "repr": 0.0,
+        "attn": 0.0,
+        "cov": 0.0,
+        "stop": 0.0,
+        "sceneq": 0.0,
+        "scenediv": 0.0,
+    }
     batches = 0
 
     schema_logged = not log_schema
@@ -242,9 +251,9 @@ def run_validation(
                                 heatmap_scene,
                                 heatmap_text,
                                 raw_heatmap,
-                                log_path,
-                            )
-                            viz_logged = True
+                            log_path,
+                        )
+                        viz_logged = True
             cosines = compute_teacher_forcing_cosines(
                 preds,
                 batch["decoder_targets"],
@@ -279,8 +288,10 @@ def run_validation(
                 text_target_list.append(batch["decoder_targets"][idx_b, :length, :])
             if scene_pred_list:
                 sceneq_loss = scene_query_matrix_loss(scene_pred_list, text_target_list)
+                scenediv_loss = scene_diversity_loss_structured(scene_pred_list, text_target_list)
             else:
                 sceneq_loss = preds.new_tensor(0.0)
+                scenediv_loss = preds.new_tensor(0.0)
             stop_targets = torch.zeros_like(stop_logits)
             for idx_b, length in enumerate(batch["scene_lengths"]):
                 last_idx = min(length, stop_targets.shape[1] - 1)
@@ -293,6 +304,7 @@ def run_validation(
             total_loss = total_loss + args.lambda_attn * attn_loss
             total_loss = total_loss + args.lambda_stop * stop_loss
             total_loss = total_loss + args.lambda_scene_query * sceneq_loss
+            total_loss = total_loss + args.lambda_scene_diversity * scenediv_loss
 
             metrics["loss"] += float(total_loss.item())
             metrics["repr"] += float(rep_loss.item())
@@ -300,6 +312,7 @@ def run_validation(
             metrics["cov"] += float(cov_loss.item())
             metrics["stop"] += float(stop_loss.item())
             metrics["sceneq"] += float(sceneq_loss.item())
+            metrics["scenediv"] += float(scenediv_loss.item())
             batches += 1
 
     if was_training:
@@ -316,6 +329,112 @@ def run_validation(
         tf_values = np.concatenate(cosine_values)
         log_teacher_forcing_cosines(tf_values, schema_label)
     return metrics
+
+
+def log_dataset_sample_similarity(
+    sample: object,
+    *,
+    video_backbone: Optional[InternVideo2VideoBackbone],
+    text_backbone: Optional[InternVideo2TextBackbone],
+    scene_model: SceneTransformer,
+    args,
+    device: torch.device,
+    dataset_type: str,
+    viz_dir: Optional[Path],
+    epoch: int,
+    label: str,
+) -> bool:
+    video_id = getattr(sample, "video_id", "(unknown)")
+    scene_texts = list(getattr(sample, "scene_texts", []) or [])
+    was_training = scene_model.training
+    scene_model.eval()
+    try:
+        with torch.no_grad():
+            batch = collate_scene_batch(
+                [sample],
+                video_backbone=video_backbone,
+                text_backbone=text_backbone,
+                scene_model=scene_model,
+                args=args,
+                device=device,
+                dataset_type=dataset_type,
+            )
+            if batch is None or not batch["scene_lengths"]:
+                logging.warning("%s visualization sample %s produced an empty batch; skipping.", label, video_id)
+                return False
+            preds, _, _ = scene_model(
+                batch["clip_embeddings"],
+                batch["clip_times"],
+                batch["clip_padding_mask"],
+                batch["decoder_inputs"],
+                batch["decoder_padding_mask"],
+            )
+            sample_length = int(batch["scene_lengths"][0])
+            if sample_length <= 0:
+                logging.warning("%s visualization sample %s has no decoded scenes; skipping.", label, video_id)
+                return False
+            pred_sample = preds[0, :sample_length, :].detach().cpu()
+            target_sample = batch["decoder_targets"][0, :sample_length, :].detach().cpu()
+            if pred_sample.numel() == 0 or target_sample.numel() == 0:
+                logging.warning(
+                    "%s visualization sample %s has empty embeddings; skipping.",
+                    label,
+                    video_id,
+                )
+                return False
+            scene_norm = F.normalize(pred_sample, dim=-1)
+            text_norm = F.normalize(target_sample, dim=-1)
+            scene_text_sim = (scene_norm @ text_norm.T).numpy()
+            text_text_sim = (text_norm @ text_norm.T).numpy()
+            raw_text_sim: Optional[np.ndarray] = None
+            raw_tensor = getattr(sample, "text_embeddings", None)
+            if raw_tensor is not None and isinstance(raw_tensor, torch.Tensor):
+                raw_slice = raw_tensor[:sample_length].detach().cpu()
+                if raw_slice.numel() > 0:
+                    raw_norm = F.normalize(raw_slice, dim=-1)
+                    raw_text_sim = (raw_norm @ raw_norm.T).numpy()
+            elif scene_texts and text_backbone is not None:
+                try:
+                    encoded = text_backbone.encode(scene_texts)
+                except Exception as exc:
+                    logging.warning(
+                        "Failed to encode raw texts for %s visualization sample %s: %s",
+                        label,
+                        video_id,
+                        exc,
+                    )
+                else:
+                    raw_slice = encoded[:sample_length].detach().cpu()
+                    if raw_slice.numel() > 0:
+                        raw_norm = F.normalize(raw_slice, dim=-1)
+                        raw_text_sim = (raw_norm @ raw_norm.T).numpy()
+            log_scene_text_similarity_matrix(video_id, scene_text_sim, scene_texts)
+            if raw_text_sim is not None:
+                log_text_similarity_matrix(f"{video_id} (raw)", raw_text_sim, scene_texts)
+            log_text_similarity_matrix(video_id, text_text_sim, scene_texts)
+            heatmap_scene = save_similarity_heatmap(video_id, scene_text_sim, scene_texts, viz_dir)
+            heatmap_text = save_text_similarity_heatmap(video_id, text_text_sim, scene_texts, viz_dir)
+            raw_heatmap = None
+            if raw_text_sim is not None:
+                raw_heatmap = save_text_similarity_heatmap(f"raw_{video_id}", raw_text_sim, scene_texts, viz_dir)
+            raw_mean = f"{float(raw_text_sim.mean()):.4f}" if raw_text_sim is not None else "n/a"
+            logging.info(
+                "%s epoch %d sample %s | scene-text mean=%.4f | text-text mean=%.4f | raw_mean=%s | sim_heatmap=%s | text_heatmap=%s | raw_heatmap=%s",
+                label,
+                epoch,
+                video_id,
+                float(scene_text_sim.mean()) if scene_text_sim.size > 0 else float("nan"),
+                float(text_text_sim.mean()) if text_text_sim.size > 0 else float("nan"),
+                raw_mean,
+                heatmap_scene,
+                heatmap_text,
+                raw_heatmap,
+            )
+            return True
+    finally:
+        if was_training:
+            scene_model.train()
+    return False
 
 
 @torch.no_grad()
@@ -749,13 +868,31 @@ def train(args: argparse.Namespace) -> None:
         args.inference_visualization_dir = args.inference_visualization_dir.expanduser()
         args.inference_visualization_dir.mkdir(parents=True, exist_ok=True)
     args.inference_visualization_max_scenes = max(1, int(args.inference_visualization_max_scenes))
-    if args.mode == "train":
+    disable_val_viz = bool(getattr(args, "disable_validation_visualizations", False))
+    if args.mode == "train" and not disable_val_viz:
         if args.validation_visualization_dir is None:
             args.validation_visualization_dir = args.inference_output.parent / "val_similarity"
         args.validation_visualization_dir = args.validation_visualization_dir.expanduser()
         args.validation_visualization_dir.mkdir(parents=True, exist_ok=True)
     else:
         args.validation_visualization_dir = None
+    if disable_val_viz:
+        args.validation_visualization_video_id = None
+    train_viz_video_id = getattr(args, "train_visualization_video_id", None)
+    if train_viz_video_id is not None:
+        train_viz_video_id = train_viz_video_id.strip()
+        if not train_viz_video_id:
+            train_viz_video_id = None
+    if args.mode != "train":
+        train_viz_video_id = None
+    args.train_visualization_video_id = train_viz_video_id
+    if args.train_visualization_video_id:
+        if args.train_visualization_dir is None:
+            args.train_visualization_dir = args.inference_output.parent / "train_similarity"
+        args.train_visualization_dir = args.train_visualization_dir.expanduser()
+        args.train_visualization_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        args.train_visualization_dir = None
     val_target_viz_video = getattr(args, "validation_visualization_video_id", None)
     if args.checkpoint_path is None:
         args.checkpoint_path = Path("scene_transformer.pt")
@@ -816,6 +953,33 @@ def train(args: argparse.Namespace) -> None:
                 split_name=split_name,
             )
         return tvr_dataset_cache[resolved]
+
+    def load_sample_by_video_id(dataset_obj: Dataset, video_id: str) -> Optional[object]:
+        if not video_id:
+            return None
+        items = getattr(dataset_obj, "items", None)
+        if isinstance(items, list):
+            for idx, meta in enumerate(items):
+                if getattr(meta, "video_id", None) == video_id:
+                    try:
+                        return dataset_obj[idx]
+                    except Exception as exc:
+                        logging.warning("Failed to load dataset sample %s: %s", video_id, exc)
+                        return None
+            return None
+        try:
+            total = len(dataset_obj)
+        except TypeError:
+            return None
+        for idx in range(total):
+            try:
+                sample = dataset_obj[idx]
+            except Exception as exc:
+                logging.warning("Failed to materialize dataset idx %d for %s: %s", idx, video_id, exc)
+                return None
+            if getattr(sample, "video_id", None) == video_id:
+                return sample
+        return None
 
     video_backbone: Optional[InternVideo2VideoBackbone] = None
     text_backbone: Optional[InternVideo2TextBackbone] = None
@@ -985,10 +1149,22 @@ def train(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         collate_fn=lambda batch: batch,
     )
+    train_viz_sample: Optional[object] = None
+    if args.train_visualization_video_id:
+        train_viz_sample = load_sample_by_video_id(dataset, args.train_visualization_video_id)
+        if train_viz_sample is None:
+            logging.warning(
+                "Train visualization sample %s not found in training split %s.",
+                args.train_visualization_video_id,
+                getattr(dataset, "split", getattr(dataset, "split_name", "train")),
+            )
     optimizer = torch.optim.AdamW(scene_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     validation_loader = None
-    if args.validation_interval > 0:
+    validation_requested = (args.validation_interval > 0) or bool(
+        getattr(args, "validation_final_epoch_only", False)
+    )
+    if validation_requested:
         try:
             if args.dataset == "qvhighlights":
                 validation_dataset = QVHighlightsDataset(args.validation_jsonl, args.concat_root, args.raw_root)
@@ -1041,6 +1217,7 @@ def train(args: argparse.Namespace) -> None:
 
     steps_per_epoch = len(data_loader)
     validation_enabled = validation_loader is not None and steps_per_epoch > 0
+    final_epoch_only = bool(getattr(args, "validation_final_epoch_only", False))
 
     def _record_loss(history: Dict[str, List[Tuple[int, float]]], name: str, step: int, value: float) -> None:
         history.setdefault(name, []).append((step, value))
@@ -1057,8 +1234,22 @@ def train(args: argparse.Namespace) -> None:
     early_stopping_patience = max(0, int(getattr(args, "early_stopping_patience", 0) or 0))
     epochs_without_improvement = 0
     stop_training = False
+    ss_enabled = bool(getattr(args, "ss_enable", False))
+    ss_warmup = int(getattr(args, "ss_warmup_epochs", 0) or 0)
+    ss_p_max = float(getattr(args, "ss_p_max", 0.0) or 0.0)
     for epoch in range(1, args.epochs + 1):
         scene_model.train()
+        if not ss_enabled:
+            ss_p = 0.0
+        elif epoch <= ss_warmup:
+            ss_p = 0.0
+        else:
+            denom = max(1, args.epochs - ss_warmup)
+            progress = (epoch - ss_warmup) / denom
+            progress = max(0.0, min(1.0, progress))
+            ss_p = ss_p_max * progress
+        if ss_enabled:
+            logging.info("Epoch %d scheduled sampling prob: %.4f", epoch, ss_p)
         steps_in_epoch = 0
         for batch_idx, batch_samples in enumerate(data_loader, start=1):
             batch = collate_scene_batch(
@@ -1077,11 +1268,38 @@ def train(args: argparse.Namespace) -> None:
                 log_batch_schema("Train", batch)
                 logged_train_batch_schema = True
 
+            decoder_inputs_tf = batch["decoder_inputs"]
+            with torch.no_grad():
+                preds_tf, _, _ = scene_model(
+                    batch["clip_embeddings"],
+                    batch["clip_times"],
+                    batch["clip_padding_mask"],
+                    decoder_inputs_tf,
+                    batch["decoder_padding_mask"],
+                )
+
+            decoder_inputs_mixed = decoder_inputs_tf.clone()
+            if ss_p > 0.0 and decoder_inputs_tf.shape[1] > 1:
+                B, L, _ = decoder_inputs_tf.shape
+                rand = torch.rand(B, L - 1, device=decoder_inputs_tf.device)
+                valid_positions = ~batch["decoder_padding_mask"][:, 1:]
+                use_pred = (rand < ss_p) & valid_positions
+                with torch.no_grad():
+                    prev_pred_tokens = preds_tf[:, :-1, :].detach()
+                if prev_pred_tokens.numel() > 0:
+                    use_pred_expanded = use_pred.unsqueeze(-1)
+                    mixed_tail = torch.where(
+                        use_pred_expanded,
+                        prev_pred_tokens,
+                        decoder_inputs_mixed[:, 1:, :],
+                    )
+                    decoder_inputs_mixed[:, 1:, :] = mixed_tail
+
             preds, attn, stop_logits = scene_model(
                 batch["clip_embeddings"],
                 batch["clip_times"],
                 batch["clip_padding_mask"],
-                batch["decoder_inputs"],
+                decoder_inputs_mixed,
                 batch["decoder_padding_mask"],
             )
             rep_loss = representation_alignment_loss(
@@ -1111,8 +1329,10 @@ def train(args: argparse.Namespace) -> None:
                 text_target_list.append(batch["decoder_targets"][idx_b, :length, :])
             if scene_pred_list:
                 sceneq_loss = scene_query_matrix_loss(scene_pred_list, text_target_list)
+                scenediv_loss = scene_diversity_loss_structured(scene_pred_list, text_target_list)
             else:
                 sceneq_loss = rep_loss.new_tensor(0.0)
+                scenediv_loss = rep_loss.new_tensor(0.0)
             stop_targets = torch.zeros_like(stop_logits)
             for idx_b, length in enumerate(batch["scene_lengths"]):
                 last_idx = min(length, stop_targets.shape[1] - 1)
@@ -1125,6 +1345,7 @@ def train(args: argparse.Namespace) -> None:
             total_loss = total_loss + args.lambda_attn * attn_loss
             total_loss = total_loss + args.lambda_stop * stop_loss
             total_loss = total_loss + args.lambda_scene_query * sceneq_loss
+            total_loss = total_loss + args.lambda_scene_diversity * scenediv_loss
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -1140,11 +1361,13 @@ def train(args: argparse.Namespace) -> None:
             _record_loss(train_loss_terms, "stop", global_step, float(stop_loss.item()))
             sceneq_loss_scalar = float(sceneq_loss.item())
             _record_loss(train_loss_terms, "sceneq", global_step, sceneq_loss_scalar)
+            scenediv_loss_scalar = float(scenediv_loss.item())
+            _record_loss(train_loss_terms, "scenediv", global_step, scenediv_loss_scalar)
 
             stop_loss_scalar = float(stop_loss.item())
             if global_step % args.log_interval == 0:
                 logging.info(
-                    "Epoch %d step %d | loss=%.4f repr=%.4f attn=%.4f cov=%.4f stop=%.4f sceneq=%.4f",
+                    "Epoch %d step %d | loss=%.4f repr=%.4f attn=%.4f cov=%.4f stop=%.4f sceneq=%.4f scenediv=%.4f",
                     epoch,
                     global_step,
                     total_loss.item(),
@@ -1153,6 +1376,7 @@ def train(args: argparse.Namespace) -> None:
                     cov_loss.item(),
                     stop_loss_scalar,
                     sceneq_loss_scalar,
+                    scenediv_loss_scalar,
                 )
 
             if args.inference_interval > 0 and global_step % args.inference_interval == 0:
@@ -1183,26 +1407,55 @@ def train(args: argparse.Namespace) -> None:
         if stop_training:
             break
 
-        if validation_enabled:
-            metrics = run_validation(
-                validation_loader,
+        if train_viz_sample is not None and args.train_visualization_video_id:
+            viz_epoch_dir: Optional[Path] = None
+            if args.train_visualization_dir is not None:
+                viz_epoch_dir = args.train_visualization_dir / f"epoch_{epoch:03d}"
+                viz_epoch_dir.mkdir(parents=True, exist_ok=True)
+            logged = log_dataset_sample_similarity(
+                train_viz_sample,
                 video_backbone=video_backbone,
                 text_backbone=text_backbone,
                 scene_model=scene_model,
                 args=args,
                 device=device,
                 dataset_type=args.dataset,
-                schema_label="Validation",
-                log_schema=not logged_val_batch_schema,
-                viz_video_id=val_target_viz_video,
-                viz_dir=args.validation_visualization_dir,
+                viz_dir=viz_epoch_dir,
                 epoch=epoch,
+                label="Train",
             )
+            if not logged:
+                logging.warning(
+                    "Train visualization logging skipped for %s at epoch %d.",
+                    args.train_visualization_video_id,
+                    epoch,
+                )
+
+        if validation_enabled:
+            should_validate = True
+            if final_epoch_only and epoch != args.epochs:
+                should_validate = False
+            metrics = None
+            if should_validate:
+                metrics = run_validation(
+                    validation_loader,
+                    video_backbone=video_backbone,
+                    text_backbone=text_backbone,
+                    scene_model=scene_model,
+                    args=args,
+                    device=device,
+                    dataset_type=args.dataset,
+                    schema_label="Validation",
+                    log_schema=not logged_val_batch_schema,
+                    viz_video_id=val_target_viz_video,
+                    viz_dir=args.validation_visualization_dir,
+                    epoch=epoch,
+                )
             if metrics is not None:
                 if not logged_val_batch_schema:
                     logged_val_batch_schema = True
                 logging.info(
-                    "Validation epoch %d | loss=%.4f repr=%.4f attn=%.4f cov=%.4f stop=%.4f sceneq=%.4f",
+                    "Validation epoch %d | loss=%.4f repr=%.4f attn=%.4f cov=%.4f stop=%.4f sceneq=%.4f scenediv=%.4f",
                     epoch,
                     metrics["loss"],
                     metrics["repr"],
@@ -1210,6 +1463,7 @@ def train(args: argparse.Namespace) -> None:
                     metrics["cov"],
                     metrics["stop"],
                     metrics["sceneq"],
+                    metrics["scenediv"],
                 )
                 val_history.append((global_step, float(metrics["loss"])))
                 _record_loss(val_loss_terms, "total", global_step, float(metrics["loss"]))
@@ -1217,6 +1471,7 @@ def train(args: argparse.Namespace) -> None:
                 _record_loss(val_loss_terms, "attn", global_step, float(metrics["attn"]))
                 _record_loss(val_loss_terms, "stop", global_step, float(metrics["stop"]))
                 _record_loss(val_loss_terms, "sceneq", global_step, float(metrics["sceneq"]))
+                _record_loss(val_loss_terms, "scenediv", global_step, float(metrics["scenediv"]))
                 improved = best_val_loss is None or metrics["loss"] < best_val_loss
                 if improved:
                     best_val_loss = float(metrics["loss"])
@@ -1243,7 +1498,7 @@ def train(args: argparse.Namespace) -> None:
                                 epochs_without_improvement,
                             )
                             stop_training = True
-            if stop_training:
+            if should_validate and stop_training:
                 break
 
     if best_epoch is None:
